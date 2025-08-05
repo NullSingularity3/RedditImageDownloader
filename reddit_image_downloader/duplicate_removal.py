@@ -14,14 +14,8 @@ class FileDuplicateRemover:
 
     @staticmethod
     def _setup_logger():
-        logger = logging.getLogger("FileDuplicateRemover")
-        logger.setLevel(logging.debug)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
-        ch = logging.StreamHandler()
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.DEBUG)
         return logger
 
     def calculate_hash(self, file_path: Path) -> str:

@@ -25,7 +25,7 @@ file_type_regex_mapping: Dict[str, re.Pattern] = {
     "gif": re.compile(r"\.(gif|gifv)", re.IGNORECASE),
     "gallery": re.compile(r"reddit\.com/gallery", re.IGNORECASE),
     "reddit_video": re.compile(r"v\.redd\.it", re.IGNORECASE),
-    "external_video": re.compile(r"/watch", re.IGNORECASE),
+    "external_media": re.compile(r"/watch", re.IGNORECASE),
 }
 
 
@@ -70,17 +70,22 @@ class RedditImageDownloader:
             self.global_downloads_path, self.user_name
         )
 
-        logger.info(
+        self.pretty_startup_log()
+
+    def pretty_startup_log(self):
+        """Logs the startup."""
+        message = (
             "\n"
-            f"╔══════════════════════════════════════════════════════╗\n"
-            f"║           Initialized RedditImageDownloader          ║\n"
-            f"╠══════════════════════════════════════════════════════╣\n"
-            f"║  Reddit Username  : {self.user_name:<33}║\n"
-            f"║  Submissions Limit: {self.submissions_limit:<33}║\n"
-            f"║  Naming Files By  : {self.name_by:<33}║\n"
-            f"║  Downloads Path   : {self.global_downloads_path:<33}║\n"
-            f"╚══════════════════════════════════════════════════════╝"
+            "═══════════════════════════════════════════════════════════\n"
+            "📥 Reddit Image Downloader — Execution Started\n"
+            "───────────────────────────────────────────────────────────\n"
+            f"🔹 Reddit Username     : {self.user_name}\n"
+            f"🔹 Submissions Limit   : {self.submissions_limit}\n"
+            f"🔹 Naming Files By     : {self.name_by}\n"
+            f"🔹 Downloads Directory : {self.global_downloads_path}\n"
+            "═══════════════════════════════════════════════════════════\n"
         )
+        logger.info(message)
 
     @staticmethod
     def get_reddit_from_filepath(credentials_filepath: str) -> asyncpraw.Reddit:
@@ -140,20 +145,45 @@ class RedditImageDownloader:
         http_session: aiohttp.ClientSession,
         source_url: str,
         target_filepath: os.PathLike,
+        retries: int = 5,
+        delay: float = 3.0,
     ) -> None:
         """
-        Download an image from a URL.
+        Download an image from a URL with retry logic.
 
         Args:
             http_session (aiohttp.ClientSession): HTTP session for making requests.
             source_url (str): The URL of the image.
             target_filepath (os.PathLike): The file path to save the image.
+            retries (int, optional): Number of retry attempts. Defaults to 3.
+            delay (float, optional): Delay between retries in seconds. Defaults to 2.0.
         """
         os.makedirs(os.path.dirname(target_filepath), exist_ok=True)
-        async with http_session.get(source_url) as response:
-            content = await response.read()
-            async with aiofiles.open(target_filepath, "wb") as file:
-                await file.write(content)
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; RedditImageDownloader/1.0)"}
+        for attempt in range(retries):
+            try:
+                async with http_session.get(source_url, headers=headers) as response:
+                    if response.status != 200:
+                        raise aiohttp.ClientError(f"HTTP {response.status}")
+                    content = await response.read()
+                    async with aiofiles.open(target_filepath, "wb") as file:
+                        await file.write(content)
+                return
+            except (
+                aiohttp.ClientError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.client_exceptions.ClientPayloadError,
+                asyncio.TimeoutError,
+            ) as e:
+                logger.error(
+                    f"Error downloading {source_url}: {e} (attempt {attempt+1}/{retries})"
+                )
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"Failed to download {source_url} after {retries} attempts."
+                    )
 
     async def _check_none_type_submission(
         self, gallery_id: str
@@ -219,7 +249,9 @@ class RedditImageDownloader:
                 f"Submission with ID {gallery_id} does not have media metadata."
             )
         except Exception as e:
-            logger.error(f"Error downloading images from gallery: {e}")
+            logger.error(
+                f"Error downloading images from gallery {gallery_id}: {repr(e)}"
+            )
         return []
 
     async def fetch_images(self) -> None:
@@ -229,7 +261,14 @@ class RedditImageDownloader:
         image_download_dir = os.path.join(self.user_downloads_path, "images")
         gif_download_dir = os.path.join(self.user_downloads_path, "gif")
         timeout = aiohttp.ClientTimeout(total=3600)
+        semaphore = asyncio.Semaphore(8)
+
         async with aiohttp.ClientSession(timeout=timeout) as http_session:
+
+            async def sem_task(task):
+                async with semaphore:
+                    return await task
+
             tasks = []
             for _, row in self.user_content_df.iterrows():
                 url_ext = row["url"].split(".")[-1]
@@ -238,19 +277,23 @@ class RedditImageDownloader:
                         image_download_dir, f"{row[self.name_by]}.{url_ext}"
                     )
                     tasks.append(
-                        self.download_image_from_url(
-                            http_session=http_session,
-                            source_url=row["url"],
-                            target_filepath=target_filepath,
+                        sem_task(
+                            self.download_image_from_url(
+                                http_session=http_session,
+                                source_url=row["url"],
+                                target_filepath=target_filepath,
+                            )
                         )
                     )
                 elif row["type"] == "gallery":
                     tasks.append(
-                        self.download_images_from_gallery(
-                            http_session=http_session,
-                            gallery_id=row["id"],
-                            target_directory=image_download_dir,
-                            entity_name=str(row[self.name_by]),
+                        sem_task(
+                            self.download_images_from_gallery(
+                                http_session=http_session,
+                                gallery_id=row["id"],
+                                target_directory=image_download_dir,
+                                entity_name=str(row[self.name_by]),
+                            )
                         )
                     )
                 elif row["type"] == "gif":
@@ -258,10 +301,12 @@ class RedditImageDownloader:
                         gif_download_dir, f"{row[self.name_by]}.{url_ext}"
                     )
                     tasks.append(
-                        self.download_image_from_url(
-                            http_session=http_session,
-                            source_url=row["url"],
-                            target_filepath=target_filepath,
+                        sem_task(
+                            self.download_image_from_url(
+                                http_session=http_session,
+                                source_url=row["url"],
+                                target_filepath=target_filepath,
+                            )
                         )
                     )
                 else:
@@ -272,7 +317,9 @@ class RedditImageDownloader:
         """
         Manage the download process by fetching submissions and images.
         """
+        logger.info("Establishing connection to Reddit API ...")
         self.reddit_client = self.get_reddit_from_filepath(DEFAULT_CREDENTIALS_FILEPATH)
+        logger.info(f"Connected. Fetching submissions for '{self.user_name}' ...")
         try:
             self.user_content_df = await self.fetch_user_submissions(self.reddit_client)
             await self.fetch_images()
